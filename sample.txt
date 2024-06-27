@@ -1,1 +1,455 @@
-contents1
+CheckLogic
+------------------------------------
+Option Explicit
+
+Public Function Check_ログ出力有無(line As String, allLines As Collection, lineNo As Long) As String
+    If InStr(line, "new SystemException") Then
+        If InStr(line, "SCWMSG") Then
+            
+        End If
+    End If
+    
+    Check_ログ出力有無 = ""
+End Function
+-------------------------------------
+
+Main
+-------------------------------------
+Option Explicit
+
+' コマンド実行結果
+Public Type CommandOutput
+    exitCode As Long
+    stdOut As New Collection
+    stdErr As New Collection
+End Type
+
+Public Sub Main()
+    Dim wb As Workbook
+    Dim ws As Worksheet
+    
+    Set wb = ThisWorkbook
+    Set ws = wb.Worksheets(1)
+    
+    '
+    ' 設定値の取得
+    '
+    Dim repoUrl As String
+    repoUrl = Trim(ws.Range("B1"))
+    
+    If repoUrl = "" Then
+        MsgBox "[リポジトリURL]" & "を入力してください"
+        Exit Sub
+    End If
+
+    ' リポジトリURLからclone先パスを生成
+    Dim idx As Long
+    Dim dirName As String
+    Dim cloneDirPath As String
+    
+    idx = InStrRev(repoUrl, "/")
+    If idx = 0 Then
+        MsgBox "[リポジトリURL]の入力値が不正です"
+        Exit Sub
+    End If
+    
+    dirName = Replace(Mid(repoUrl, idx + 1), ".git", "")
+    cloneDirPath = wb.path & "\" & dirName
+    Debug.Print "cloneDirPath=" & cloneDirPath
+
+    '
+    ' git clone or fetch
+    '
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    
+    Dim cmdOutput As CommandOutput
+
+    If fso.FolderExists(cloneDirPath) Then
+        cmdOutput = FetchRepository(cloneDirPath)
+        
+        If cmdOutput.exitCode <> 0 Then
+            MsgBox "git cloneに失敗しました。"
+            Exit Sub
+        End If
+    
+    Else
+        cmdOutput = CloneRepository(repoUrl, cloneDirPath)
+        
+        If cmdOutput.exitCode <> 0 Then
+            MsgBox "git cloneに失敗しました。"
+            Exit Sub
+        End If
+    End If
+    
+    '
+    ' git branch
+    '
+    cmdOutput = GetAllRemoteBranches(cloneDirPath)
+    
+    If cmdOutput.exitCode <> 0 Then
+        MsgBox "git branchに失敗しました。"
+        Exit Sub
+    End If
+    
+    ' ブランチ名の一覧を生成
+    Dim branches As Collection
+    Set branches = ConvLocalBranchNames(cmdOutput.stdOut)
+    
+    ' ブランチの数だけ繰り返す
+    Dim resultList As Collection ' As Dictionary<String,CodeCheckResult>
+    Dim result As CodeCheckResult
+    Dim branch As Variant
+    
+    Set resultList = New Collection
+    
+    For Each branch In branches
+        '
+        ' git checkout
+        '
+        cmdOutput = CheckoutBranche(CStr(branch), cloneDirPath)
+        
+        If cmdOutput.exitCode <> 0 Then
+            Set result = New CodeCheckResult
+            result.branch = branch
+            result.filePath = "-"
+            result.lineNo = -1
+            result.errMsg = "git checkoutに失敗しました"
+            result.lineContents = "-"
+            
+            resultList.Add result
+            GoTo Continue
+        End If
+
+        '
+        ' git pull
+        '
+        cmdOutput = PullRepository(cloneDirPath)
+        
+        If cmdOutput.exitCode <> 0 Then
+            Set result = New CodeCheckResult
+            result.branch = branch
+            result.filePath = "-"
+            result.lineNo = -1
+            result.errMsg = "git pullに失敗しました"
+            result.lineContents = "-"
+            
+            resultList.Add result
+            GoTo Continue
+        End If
+        
+        '
+        ' check code
+        '
+        CheckCode cloneDirPath, CStr(branch), resultList, fso
+Continue:
+    Next
+    
+    Debug.Print "fin."
+End Sub
+
+Private Function ConvLocalBranchNames(stdOut As Collection) As Collection
+    Dim branches As Collection
+    Dim line As Variant
+    
+    Set branches = New Collection
+    For Each line In stdOut
+        line = Trim(line)
+        ' featureブランチのみを対象にする
+        If InStr(line, "feature/") <> 0 Then
+            branches.Add Replace(line, "origin/", "")
+        End If
+    Next
+    
+    Set ConvLocalBranchNames = branches
+End Function
+
+Private Sub CheckCode(cloneDirPath As String, branch As String, resultList As Collection, fso As Object)
+    
+    Dim result As CodeCheckResult
+    Dim emptyFiles As Boolean
+    emptyFiles = True
+    
+    Dim filePaths As Collection
+    Dim filePath As Variant
+    Set filePaths = GetAllFilePaths(cloneDirPath, fso)
+    
+    Dim procId As String
+    procId = Replace(branch, "-", "")
+    If Len(procId) >= 7 Then
+        procId = LCase(Right(procId, 7))
+    End If
+    
+    For Each filePath In filePaths
+        
+        ' 対象ファイル
+        If InStr(CStr(filePath), procId) >= 1 Then
+            Debug.Print "Checking... Branch=" & branch & ", File=" & filePath
+        
+            Dim allLines As Collection
+            Set allLines = ReadFileLinesToCollection(ReadUTF8File(CStr(filePath)))
+            
+            emptyFiles = False
+            
+            Dim lineNo As Long
+            Dim errMsg As String
+            
+            For lineNo = 1 To allLines.Count
+            
+                ' ===== Check1 =====
+                errMsg = Check_ログ出力有無(allLines(lineNo), allLines, lineNo)
+                If errMsg <> "" Then
+                    Set result = New CodeCheckResult
+                    result.branch = branch
+                    result.filePath = filePath
+                    result.lineNo = lineNo
+                    result.errMsg = errMsg
+                    result.lineContents = allLines(lineNo)
+                    resultList.Add result
+                End If
+            Next
+        End If
+    Next
+
+    If emptyFiles Then
+        Set result = New CodeCheckResult
+        result.branch = branch
+        result.filePath = "-"
+        result.lineNo = -1
+        result.errMsg = "ファイルが0件です。"
+        result.lineContents = "-"
+        resultList.Add result
+    End If
+End Sub
+-------------------------------------
+
+Utils
+-------------------------------------
+Option Explicit
+
+Public Function ExecuteCommand(command As String, args As Collection, currentDir As String) As CommandOutput
+    Dim wsh As Object
+    Dim exec As Object
+    Dim output As CommandOutput
+    Dim commandLine As String
+    Dim arg As Variant
+    
+    Set wsh = CreateObject("WScript.Shell")
+    Set output.stdOut = New Collection
+    Set output.stdErr = New Collection
+    
+    If Trim(currentDir) <> "" Then
+        command = "cd /d """ & currentDir & """ && " & command
+    End If
+
+    commandLine = command
+    
+    For Each arg In args
+        If arg = "2>NUL" Or arg = "||" Or arg = "&&" Then
+            commandLine = commandLine & " " & arg
+        Else
+            commandLine = commandLine & " """ & arg & """"
+        End If
+    Next
+    
+    ' コマンドを実行
+    Set exec = wsh.exec("cmd /c " & commandLine)
+    
+    ' 標準出力を読み取り
+    Do While Not exec.stdOut.AtEndOfStream
+        output.stdOut.Add exec.stdOut.ReadLine()
+    Loop
+    
+    ' 標準エラーを読み取り
+    Do While Not exec.stdErr.AtEndOfStream
+        output.stdErr.Add exec.stdErr.ReadLine()
+    Loop
+    
+    ' 結果コードを取得
+    output.exitCode = exec.exitCode
+    
+    DebugPrintCommandOutput commandLine, output
+
+    ExecuteCommand = output
+End Function
+
+Public Function CloneRepository(repoUrl As String, clonePath) As CommandOutput
+    Dim cmdArgs As Collection
+    Dim cmdOutput As CommandOutput
+
+    Set cmdArgs = New Collection
+    cmdArgs.Add "clone"
+    cmdArgs.Add repoUrl
+    cmdArgs.Add clonePath
+    cmdOutput = ExecuteCommand("git", cmdArgs, "")
+
+    CloneRepository = cmdOutput
+End Function
+
+Public Function FetchRepository(currentDir As String) As CommandOutput
+    Dim cmdArgs As Collection
+    Dim cmdOutput As CommandOutput
+
+    Set cmdArgs = New Collection
+    cmdArgs.Add "fetch"
+    cmdOutput = ExecuteCommand("git", cmdArgs, currentDir)
+    
+    FetchRepository = cmdOutput
+End Function
+
+Public Function GetAllRemoteBranches(currentDir As String) As CommandOutput
+    Dim cmdArgs As Collection
+    Dim cmdOutput As CommandOutput
+
+    Set cmdArgs = New Collection
+    cmdArgs.Add "branch"
+    cmdArgs.Add "-r"
+    cmdOutput = ExecuteCommand("git", cmdArgs, currentDir)
+    
+    GetAllRemoteBranches = cmdOutput
+End Function
+
+Public Function CheckoutBranche(branchName As String, currentDir As String) As CommandOutput
+    Dim cmdArgs As Collection
+    Dim cmdOutput As CommandOutput
+
+    Set cmdArgs = New Collection
+    cmdArgs.Add "checkout"
+    cmdArgs.Add branchName
+    cmdArgs.Add "2>NUL"
+    cmdArgs.Add "||"
+    cmdArgs.Add "git"
+    cmdArgs.Add "checkout"
+    cmdArgs.Add "-b"
+    cmdArgs.Add branchName
+    cmdArgs.Add "origin/" & branchName
+    cmdOutput = ExecuteCommand("git", cmdArgs, currentDir)
+    CheckoutBranche = cmdOutput
+
+End Function
+
+Public Function PullRepository(currentDir As String) As CommandOutput
+    Dim cmdArgs As Collection
+    Dim cmdOutput As CommandOutput
+
+    Set cmdArgs = New Collection
+    cmdArgs.Add "pull"
+    cmdOutput = ExecuteCommand("git", cmdArgs, currentDir)
+    
+    PullRepository = cmdOutput
+End Function
+
+Public Function ReadFileLinesToCollection(fileContents As String) As Collection
+    
+    Dim tempLines As Variant
+    fileContents = Replace(fileContents, vbCrLf, vbLf)
+    tempLines = Split(fileContents, vbLf)
+    
+    Dim lines As Collection
+    Set lines = New Collection
+    
+    Dim line As Variant
+    For Each line In tempLines
+        lines.Add line
+    Next line
+    
+    Set ReadFileLinesToCollection = lines
+End Function
+
+Public Function GetAllFilePaths(ByRef dirPath As String, ByRef fso As Object) As Collection
+    Dim folder As Object
+    Dim file As Object
+    Dim subFolder As Object
+    Dim filePaths As Collection
+    
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set filePaths = New Collection
+
+    ' 指定フォルダ内のすべてのファイルを取得
+    Set folder = fso.GetFolder(dirPath)
+    For Each file In folder.Files
+        filePaths.Add file.path
+    Next file
+
+    ' 指定フォルダ内のすべてのサブフォルダを再帰的に処理
+    For Each subFolder In folder.SubFolders
+        Dim subFilePaths As Collection
+        Set subFilePaths = GetAllFilePaths(subFolder.path, fso)
+        
+        Dim subFilePath As Variant
+        For Each subFilePath In subFilePaths
+            filePaths.Add subFilePath
+        Next subFilePath
+    Next
+
+    Set GetAllFilePaths = filePaths
+    Exit Function
+End Function
+
+Public Function ReadUTF8File(filePath As String) As String
+    Dim stream As Object
+    Set stream = CreateObject("ADODB.Stream")
+
+    With stream
+        .Type = 1 ' adTypeBinary
+        .Open
+        .LoadFromFile filePath
+        ' UTF-8 BOMをスキップするために先頭3バイトを確認
+        If .Size >= 3 Then
+            .Position = 0
+            Dim bom As Variant
+            bom = .Read(3)
+            If bom(0) = &HEF And bom(1) = &HBB And bom(2) = &HBF Then
+                ' UTF-8 BOMが存在する場合
+                .Position = 3
+            Else
+                ' UTF-8 BOMが存在しない場合
+                .Position = 0
+            End If
+        End If
+        .Type = 2 ' adTypeText
+        .Charset = "utf-8"
+    End With
+
+    Dim content As String
+    content = stream.ReadText(-1) ' -1: adReadAll
+
+    stream.Close
+    Set stream = Nothing
+
+    ReadUTF8File = content
+End Function
+
+Private Sub DebugPrintCommandOutput(commandLine As String, cmdOutout As CommandOutput)
+    Dim output As String
+    Dim line As Variant
+    
+    output = "[Command]" & vbCrLf & "  " & commandLine & vbCrLf
+    output = output & "[Exit code]" & vbCrLf & "  " & cmdOutout.exitCode & vbCrLf
+    
+    output = output & "[StdOut]" & vbCrLf
+    For Each line In cmdOutout.stdOut
+        output = output & "  " & line & vbCrLf
+    Next line
+    
+    output = output & "[StdErr]" & vbCrLf
+    For Each line In cmdOutout.stdErr
+        output = output & "  " & line & vbCrLf
+    Next line
+    
+    Debug.Print output
+End Sub
+-------------------------------------
+
+
+CodeCheckResult
+-------------------------------------
+Option Explicit
+
+' ソースコードチェック結果
+Public branch As String
+Public filePath As String
+Public lineNo As Long
+Public errMsg As String
+Public lineContents As String
+-------------------------------------
